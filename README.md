@@ -1,6 +1,6 @@
-# dbdiff
+# pg-schema-diff
 
-Compares two postgresql databases and prints SQL commands to modify the first one in order to match the second one.
+Compares two schemas in postgresql databases and prints SQL commands to modify the first one in order to match the second one.
 
 **It does NOT execute the statements**. It only prints the statements to the standard output.
 
@@ -9,24 +9,29 @@ Compares two postgresql databases and prints SQL commands to modify the first on
 Install globally with `npm`
 
 ```
-npm install dbdiff -g
+npm install pg-schema-diff -g
 ```
 
 # Usage
 
 ```
-dbdiff \
+pg-schema-diff \
   postgres://user:pass@host[:port]/dbname1 \
-  postgres://user:pass@host[:port]/dbname2
+  schemaname1 \
+  postgres://user:pass@host[:port]/dbname2 \
+  schemaname2 
 ```
+
+The first database connection string and schema name describe the ‘current schema’. The second pair describe the ‘future schema’. The output describes the commands required to move from the current schema to the future schema.
+
 
 # Caveats
 
-Some statements may fail or may produce data loss depending on the data stored in the target database. For example:
+Some statements may fail or may produce data loss depending on the data stored in the target schema. For example:
 
 ## Dropping tables and columns
 
-`dbdiff` will generate `DROP TABLE` and `DROP COLUMN` statements. Make sure you want to drop those tables / columns.
+`pg-schema-diff` will generate `DROP TABLE` and `DROP COLUMN` statements. Make sure you want to drop those tables / columns.
 
 ## Changing the data type of existing columns
 
@@ -43,6 +48,10 @@ So you will need to specify a `USING` expression to perform de conversion. For e
 ALTER TABLE table_name
   ALTER column_name TYPE data_type USING column_name::integer
 ```
+
+## Table Column CONSTRAINTs 
+
+At this version table column constraints are compared but the SQL statements are not generated. `pg-schema-diff` will output comments describing differences between the schemas.
 
 ## NOT NULL violations
 

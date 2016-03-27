@@ -13,50 +13,50 @@ dbdiff.log = function() {
   dbdiff.logger(msg)
 }
 
-dbdiff.describeDatabase = function(conString, callback) {
+dbdiff.describeDatabase = function(conString, schemaname, callback) {
   var client = new pg.Client(conString)
-  var schema = {
-    tables: {},
-  }
+  var schema = { tables: {} }
 
   txain(function(callback) {
     client.connect(callback)
   })
   .then(function(client, done, callback) {
-    client.query('SELECT * FROM pg_tables WHERE schemaname NOT IN ($1, $2, $3)', ['temp', 'pg_catalog', 'information_schema'], callback)
+    //console.log('connected')
+    client.query('SELECT * FROM pg_tables WHERE schemaname = $1', [ schemaname ], callback)
   })
   .then(function(result, callback) {
+    //console.log('got tables', result)
     callback(null, result.rows)
   })
   .map(function(table, callback) {
+    //console.log('map table', table)
     var query = multiline(function() {;/*
       SELECT
         table_name,
-        table_schema,
         column_name,
         data_type,
         udt_name,
         character_maximum_length,
         is_nullable,
-        column_default
+        '' as column_default
       FROM
         INFORMATION_SCHEMA.COLUMNS
       WHERE
         table_name=$1 AND table_schema=$2;
     */})
-    client.query(query, [table.tablename, table.schemaname], callback)
+    client.query(query, [table.tablename, schemaname], callback)
   })
   .then(function(descriptions, callback) {
+    //console.log('got descriptions', descriptions)
     var tables = schema.tables = {}
     descriptions.forEach(function(desc) {
       desc.rows.forEach(function(row) {
-        var tableName = util.format('"%s"."%s"', row.table_schema, row.table_name)
+        var tableName = row.table_name
         var table = tables[tableName]
         if (!table) {
           tables[tableName] = []
           table = tables[tableName]
         }
-        delete row.table_schema
         delete row.table_name
         table.push(row)
       })
@@ -65,8 +65,7 @@ dbdiff.describeDatabase = function(conString, callback) {
     var query = multiline(function() {;/*
       SELECT
         i.relname as indname,
-        i.relowner as indowner,
-        idx.indrelid::regclass,
+        split_part(CAST(idx.indrelid::regclass as TEXT),'.',2),
         am.amname as indam,
         idx.indkey,
         ARRAY(
@@ -85,24 +84,60 @@ dbdiff.describeDatabase = function(conString, callback) {
         ON i.relam = am.oid
       JOIN pg_namespace as ns
         ON ns.oid = i.relnamespace
-        AND ns.nspname NOT IN ('pg_catalog', 'pg_toast');
+        AND ns.nspname NOT IN ('pg_catalog', 'pg_toast')
+      WHERE ns.nspname = $1;
     */})
-    client.query(query, callback)
+    client.query(query, [schemaname], callback)
   })
-  .then(function(result, callback) {
-    schema.indexes = result.rows
-    client.query('SELECT * FROM information_schema.sequences', callback)
+  .then(function(indexes, callback) {
+    //console.log('got indexes', result)
+    schema.indexes = indexes.rows
+
+    var query = multiline(function() {;/*
+      SELECT
+        constraint_name,
+        table_name,
+        column_name,
+        ordinal_position,
+        position_in_unique_constraint
+      FROM
+        INFORMATION_SCHEMA.key_column_usage
+      WHERE table_schema = $1;
+    */})
+    client.query(query, [schemaname], callback)
+  })
+  .then(function(constraints, callback) {
+    //console.log('got constraints', result)
+    schema.constraints = constraints.rows
+    var query = multiline(function() {;/*
+      SELECT 
+       sequence_name,
+       data_type,
+       numeric_precision,
+       numeric_precision_radix,
+       numeric_scale,
+       start_value,
+       minimum_value,
+       maximum_value,
+       increment,
+       cycle_option
+      FROM 
+        information_schema.sequences
+      WHERE sequence_schema = $1;
+    */})
+    client.query(query, [schemaname], callback)
   }).then(function(result, callback) {
+    //console.log('got sequences', result)
     schema.sequences = result.rows
     schema.sequences.forEach(function(sequence) {
-      sequence.name = util.format('"%s"."%s"', sequence.sequence_schema, sequence.sequence_name)
+      sequence.name = sequence.sequence_name
     })
     client.query('SELECT current_schema()', callback)
   })
   .end(function(err, result) {
+    //console.log('reached the end', result)
     client.end()
     if (err) return callback(err)
-    schema.public_schema = result.rows[0].current_schema
     callback(null, schema)
   })
 }
@@ -154,14 +189,12 @@ function compareTables(tableName, db1, db2) {
 
   diff1.forEach(function(columnName) {
     dbdiff.log('ALTER TABLE %s DROP COLUMN "%s";', tableName, columnName)
-    dbdiff.log()
   })
 
   diff2.forEach(function(columnName) {
     var col = _.findWhere(table2, { column_name: columnName })
     var type = dataType(col)
     dbdiff.log('ALTER TABLE %s ADD COLUMN "%s" %s;', tableName, columnName, columnDescription(col))
-    dbdiff.log()
   })
 
   var common = _.intersection(columNames1, columNames2)
@@ -174,7 +207,6 @@ function compareTables(tableName, db1, db2) {
       || col1.character_maximum_length !== col2.character_maximum_length) {
       dbdiff.log('-- Previous data type was %s', dataType(col1))
       dbdiff.log('ALTER TABLE %s ALTER COLUMN "%s" SET DATA TYPE %s;', tableName, columnName, dataType(col2))
-      dbdiff.log()
     }
     if (col1.is_nullable !== col2.is_nullable) {
       if (col2.is_nullable === 'YES') {
@@ -182,7 +214,6 @@ function compareTables(tableName, db1, db2) {
       } else {
         dbdiff.log('ALTER TABLE %s ALTER COLUMN "%s" SET NOT NULL;', tableName, columnName)
       }
-      dbdiff.log()
     }
   })
 }
@@ -228,7 +259,6 @@ function compareIndexes(tableName, db1, db2) {
       dbdiff.log('-- Index "%s"."%s" needs to be changed', index.nspname, index.indname)
       dbdiff.log('DROP INDEX "%s"."%s";', index.nspname, index.indname)
       dbdiff.log('CREATE INDEX "%s" ON %s USING %s (%s);', index.indname, index.indrelid, index.indam, index.indkey_names.join(','))
-      dbdiff.log()
     }
   })
 }
@@ -263,13 +293,11 @@ function compareSequences(db1, db2) {
 
   diff1.forEach(function(sequenceName) {
     dbdiff.log('DROP SEQUENCE %s;', sequenceName)
-    dbdiff.log()
   })
 
   diff2.forEach(function(sequenceName) {
     var sequence = _.findWhere(db2.sequences, { name: sequenceName })
     dbdiff.log(sequenceDescription(sequence))
-    dbdiff.log()
   })
 
   var inter = _.intersection(sequenceNames1, sequenceNames2)
@@ -283,13 +311,67 @@ function compareSequences(db1, db2) {
     if (desc2 !== desc1) {
       dbdiff.log('DROP SEQUENCE %s;', sequenceName)
       dbdiff.log(desc2)
-      dbdiff.log()
+    }
+  })
+}
+
+function constraintDescription(constraint) {
+  return util.format('-- Need to ADD CONSTRAINT "%s" for Column "%s" on Table "%s"',
+    constraint.constraint_name,
+    constraint.column_name,
+    constraint.table_name);
+/*  
+  return util.format('CREATE SEQUENCE %s INCREMENT %s %s %s %s %s CYCLE;',
+      sequence.name,
+      sequence.increment,
+      isNumber(sequence.minimum_value) ? 'MINVALUE '+sequence.minimum_value : 'NO MINVALUE',
+      isNumber(sequence.maximum_value) ? 'MAXVALUE '+sequence.maximum_value : 'NO MAXVALUE',
+      isNumber(sequence.start_value) ? 'START '+sequence.start_value : '',
+      sequence.cycle_option === 'NO' ? 'NO' : ''
+    )
+*/
+}
+
+function constraintNames(db) {
+  return db.constraints.map(function(constraint) {
+    return constraint.constraint_name
+  }).sort()
+}
+
+function compareConstraints(db1, db2) {
+  var constraintNames1 = constraintNames(db1)
+  var constraintNames2 = constraintNames(db2)
+
+  var diff1 = _.difference(constraintNames1, constraintNames2)
+  var diff2 = _.difference(constraintNames2, constraintNames1)
+
+  diff1.forEach(function(constraintName) {
+    dbdiff.log('-- Need to DROP CONSTRAINT "%s" - not in target database', constraintName)
+  })
+
+  diff2.forEach(function(constraintName) {
+    var constraint = _.findWhere(db2.constraints, { constraint_name: constraintName })
+    dbdiff.log(constraintDescription(constraint))
+  })
+
+  var inter = _.intersection(constraintNames1, constraintNames2)
+  inter.forEach(function(constraintName) {
+    var constraint1 = _.findWhere(db1.constraints, { constraint_name: constraintName })
+    var constraint2 = _.findWhere(db2.constraints, { constraint_name: constraintName })
+
+    var desc1 = constraintDescription(constraint1)
+    var desc2 = constraintDescription(constraint2)
+
+    if (desc2 !== desc1) {
+      dbdiff.log('-- Need to DROP CONSTRAINT "%s" - not in target database', constraintName)
+      dbdiff.log(desc2)
     }
   })
 }
 
 dbdiff.compareSchemas = function(db1, db2) {
   compareSequences(db1, db2)
+  compareConstraints(db1, db2)
 
   var tableNames1 = _.keys(db1.tables).sort()
   var tableNames2 = _.keys(db2.tables).sort()
@@ -298,8 +380,7 @@ dbdiff.compareSchemas = function(db1, db2) {
   var diff2 = _.difference(tableNames2, tableNames1)
 
   diff1.forEach(function(tableName) {
-    dbdiff.log('DROP TABLE %s;', tableName)
-    dbdiff.log()
+    dbdiff.log('DROP TABLE %s.%s;', db2.schema, tableName)
   })
 
   diff2.forEach(function(tableName) {
@@ -307,15 +388,12 @@ dbdiff.compareSchemas = function(db1, db2) {
       var type = dataType(col)
       return '\n  "'+col.column_name+'" '+columnDescription(col)
     })
-    dbdiff.log('CREATE TABLE %s (%s', tableName, columns.join(','))
-    dbdiff.log(');')
-    dbdiff.log()
+    dbdiff.log('CREATE TABLE %s.%s (%s);', db2.schema, tableName, columns.join(','))
 
     var indexNames2 = indexNames(tableName, db2.indexes)
     indexNames2.forEach(function(indexName) {
       var index = _.findWhere(db2.indexes, { indname: indexName })
       dbdiff.log('CREATE INDEX "%s" ON %s USING %s (%s);', index.indname, index.indrelid, index.indam, index.indkey_names.join(','))
-      dbdiff.log()
     })
   })
 
@@ -326,41 +404,47 @@ dbdiff.compareSchemas = function(db1, db2) {
   })
 }
 
-dbdiff.compareDatabases = function(conn1, conn2, callback) {
-  var db1, db2
+dbdiff.compareDatabases = function(comparison, callback) {
+  var currentDatabase = comparison.current
+  var targetDatabase = comparison.target
+  var dbout1, dbout2
   txain(function(callback) {
-    dbdiff.describeDatabase(conn1, callback)
+    dbdiff.describeDatabase(currentDatabase.conn, currentDatabase.schema, callback)
   })
-  .then(function(db, callback) {
-    db1 = db
-    dbdiff.describeDatabase(conn2, callback)
+  .then(function(dbout, callback) {
+    dbout1 = dbout
+    dbout1.schema = currentDatabase.schema
+    dbdiff.describeDatabase(targetDatabase.conn, targetDatabase.schema, callback)
   })
-  .then(function(db, callback) {
-    db2 = db
-    dbdiff.compareSchemas(db1, db2)
+  .then(function(dbout, callback) {
+    dbout2 = dbout
+    dbout2.schema = targetDatabase.schema
+    dbdiff.compareSchemas(dbout1, dbout2)
     callback()
   })
   .end(callback)
 }
 
-if (module.id === require.main.id) {
+if (require.main && module.id === require.main.id) {
   var yargs = require('yargs')
   var argv = yargs
-      .usage('Usage: $0 conn_string1 conn_string2')
-      .example('$0 postgres://user:pass@host[:port]/dbname1 postgres://user:pass@host[:port]/dbname2',
-        'compares the scheme of two databases and prints the SQL commands to modify the first one in order to match the second one')
-      .demand(2)
+      .usage('Usage: $0 conn_string1 schema1 conn_string2 schema2')
+      .example('$0 postgres://user:pass@host[:port]/dbname1 schema1 postgres://user:pass@host[:port]/dbname2 schema2',
+        'compares a single postgres schema against another schema and prints the SQL commands to modify the first one in order to match the second one')
+      .demand(4)
       .wrap(yargs.terminalWidth())
       .help('h')
       .alias('h', 'help')
       .argv
 
   var conn1 = argv._[0]
-  var conn2 = argv._[1]
+  var schema1 = argv._[1]
+  var conn2 = argv._[2]
+  var schema2 = argv._[3]
   dbdiff.logger = function(msg) {
     console.log(msg)
   }
-  dbdiff.compareDatabases(conn1, conn2, function(err) {
+  dbdiff.compareDatabases({ current: {conn: conn1, schema: schema1 }, target: {conn: conn2, schema: schema2} }, function(err) {
     if (err) {
       console.error(String(err))
       process.exit(1)
